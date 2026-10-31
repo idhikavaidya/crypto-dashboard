@@ -7,7 +7,9 @@ seconds by polling Binance's public REST API (no API key needed).
 """
 import os
 import random
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import plotly.graph_objects as go
 import requests
@@ -31,7 +33,7 @@ FREQUENCIES = {
 ORDER = list(FREQUENCIES)
 CHART_ROTATION = (30, 40)   # seconds between large-panel coin changes
 TIME_SWITCH = (10, 15)      # seconds between time-window changes per panel
-REFRESH_SECONDS = 3
+REFRESH_SECONDS = 5
 
 # Binance blocks some regions (incl. the US, where Streamlit Cloud runs), so
 # try the global API, then Binance's public market-data mirror, then Binance.US.
@@ -106,13 +108,38 @@ def _fetch_klines(symbol, interval):
     return df, base
 
 
-# One cache per refresh speed, so fast intervals refresh often and slow ones rarely.
-_cached = {ttl: st.cache_data(ttl=ttl, show_spinner=False)(_fetch_klines)
-           for ttl in {f[2] for f in FREQUENCIES.values()}}
+# Small shared cache: fast intervals refresh often, slow ones rarely.
+_CACHE, _LOCK = {}, threading.Lock()
 
 
 def get_klines(symbol, interval):
-    return _cached[FREQUENCIES[interval][2]](symbol, interval)
+    key, ttl = (symbol, interval), FREQUENCIES[interval][2]
+    with _LOCK:
+        hit = _CACHE.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    try:
+        value = _fetch_klines(symbol, interval)
+    except Exception:
+        if hit:               # keep showing the last good data on a blip
+            return hit[1]
+        raise
+    with _LOCK:
+        _CACHE[key] = (time.time(), value)
+    return value
+
+
+def prefetch(pairs):
+    """Download all panels' series in parallel so a refresh finishes quickly."""
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(lambda p: _safe(get_klines, *p), pairs))
+
+
+def _safe(fn, *args):
+    try:
+        return fn(*args)
+    except Exception:  # noqa: BLE001 – the panel shows its own error
+        return None
 
 
 @st.cache_data(ttl=10, show_spinner=False)
@@ -243,6 +270,7 @@ def dashboard():
 
     large = SYMBOLS[st.session_state.large]
     others = [s for s in SYMBOLS if s != large]
+    prefetch([(s, p["interval"]) for s, p in zip([large] + others, st.session_state.panels)])
 
     try:
         tickers = get_tickers()
@@ -263,7 +291,7 @@ def dashboard():
 
     ticker_strip(tickers, reverse=True)
     st.caption(f"Updated {pd.Timestamp.now(tz=TZ).strftime('%H:%M:%S')} · "
-               f"refreshes every {REFRESH_SECONDS}s")
+               f"refreshes every {REFRESH_SECONDS}s · source: {_GOOD_BASE or 'n/a'}")
 
 
 dashboard()
